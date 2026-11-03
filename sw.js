@@ -1,5 +1,5 @@
 // Caches the app so it opens instantly and works offline. Your bill data is not stored here.
-const CACHE = 'bills-v1';
+const CACHE = 'bills-v2';
 const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {

@@ -7,7 +7,7 @@
    ========================================================= */
 
 const KEY = 'billtracker.v1';
-const APP_VERSION = '2.0';
+const APP_VERSION = '2.2';
 const COLORS = ['#8FB3FF', '#F2C46D', '#7FD1C2', '#E9A0D8', '#FFB38A', '#B9A3FF', '#A8D88F', '#9FD8F0', '#F59FB0', '#C9C2B5'];
 const GREEN = '#6FD3A8';
 const BILL_DEFAULTS = [['Housing', '#8FB3FF'], ['Utilities', '#F2C46D'], ['Vehicle', '#7FD1C2'], ['Animals', '#E9A0D8'], ['Medical', '#FFB38A'], ['Entertainment', '#B9A3FF'], ['Health', '#A8D88F'], ['Insurance', '#9FD8F0'], ['Subscriptions', '#F59FB0'], ['Other', '#C9C2B5']];
@@ -99,7 +99,7 @@ function blank() {
   return {
     app: 'bill-tracker', version: 2, bills: [], payments: [],
     categories: mk(BILL_DEFAULTS),
-    spendCategories: mk(SPEND_DEFAULTS, { period: 'month', rollover: false }),
+    spendCategories: mk(SPEND_DEFAULTS, { period: 'month', rollover: false, subs: [] }),
     incomeCategories: mk(INCOME_DEFAULTS),
     goals: mk(GOAL_DEFAULTS, { target: 0, start: 0 }),
     incomes: [], receipts: [], purchases: [], transfers: [], budgets: {},
@@ -128,10 +128,10 @@ function migrate(d) {
     });
   }
   out.bills.forEach((x) => { x.split = x.split || { on: false, type: 'percent', value: 50 }; if (x.remind == null) x.remind = -1; });
-  out.spendCategories.forEach((c) => { c.period = c.period === 'week' ? 'week' : 'month'; c.rollover = !!c.rollover; });
+  out.spendCategories.forEach((c) => { c.period = c.period === 'week' ? 'week' : 'month'; c.rollover = !!c.rollover; c.subs = Array.isArray(c.subs) ? c.subs : []; });
   out.goals.forEach((g) => { g.target = +g.target || 0; g.start = +g.start || 0; });
   out.incomes.forEach((x) => { if (x.remind == null) x.remind = true; });
-  for (const k of Object.keys(out.budgets)) { const v = out.budgets[k] || {}; out.budgets[k] = { spend: v.spend || {}, savings: v.savings || {} }; }
+  for (const k of Object.keys(out.budgets)) { const v = out.budgets[k] || {}; out.budgets[k] = { spend: v.spend || {}, savings: v.savings || {}, sub: v.sub || {} }; }
   return out;
 }
 function load() {
@@ -283,7 +283,11 @@ const goalBalance = (g) => r2((+g.start || 0) + sumBy(db.transfers.filter((x) =>
 
 /* budgets — stored per month as monthly amounts */
 const budOf = (k) => db.budgets[k];
-const ensureBud = (k) => (db.budgets[k] = db.budgets[k] || { spend: {}, savings: {} });
+const ensureBud = (k) => { const b = (db.budgets[k] = db.budgets[k] || { spend: {}, savings: {}, sub: {} }); b.sub = b.sub || {}; return b; };
+const subsOf = (c) => (c && Array.isArray(c.subs) ? c.subs : []);
+const subAmt = (k, id) => +((budOf(k) || {}).sub || {})[id] || 0;
+const subSpent = (subId, k) => sumBy(db.purchases.filter((p) => p.subId === subId && p.date >= mFirst(k) && p.date <= mLast(k)), (p) => +p.amount);
+const subName = (c, id) => (subsOf(c).find((s) => s.id === id) || {}).name || '';
 const bAmt = (k, id) => +((budOf(k) || {}).spend || {})[id] || 0;
 const sAmt = (k, id) => +((budOf(k) || {}).savings || {})[id] || 0;
 const weeklyOf = (monthly, k) => r2(monthly * 7 / mDays(k));
@@ -321,7 +325,7 @@ function budgetIn(from, to, kind) {
 
 /* ---------- UI state ---------- */
 const ui = { sort: 'date', filter: 'all', q: '', calMode: 'month', calDate: todayS(), calSel: todayS(), lastTab: '',
-  budMode: 'month', budMonth: mKey(todayS()), insMode: 'month', insDate: todayS(), setList: 'bill' };
+  budMode: 'month', budMonth: mKey(todayS()), revMode: 'month', revDate: todayS(), insMode: 'month', insDate: todayS(), setList: 'bill' };
 let draft = null, draftFor = null, sheet = null;
 
 /* ---------- routing / render ---------- */
@@ -351,6 +355,7 @@ function render() {
     case 'purchase': html = vPurchase(r.a === 'edit' ? r.b : null); break;
     case 'income': html = vIncome(r.a === 'edit' ? r.b : null); break;
     case 'purchases': html = vPurchases(r.a); break;
+    case 'review': html = vReview(); break;
     default: html = vHome();
   }
   app.innerHTML = html;
@@ -362,7 +367,7 @@ function render() {
 function renderTabs(name) {
   const tabs = $('#tabs');
   tabs.hidden = DRAFT_ROUTES.includes(name);
-  const cur = name === 'bill' ? 'bills' : name === 'purchases' ? 'budget' : name;
+  const cur = name === 'bill' ? 'bills' : name === 'purchases' || name === 'review' ? 'budget' : name;
   const t = (h, icon, label) => `<a href="#/${h}"${h === cur ? ' aria-current="page"' : ''}>${icon}${label}</a>`;
   tabs.innerHTML = t('', I.home, 'Home') + t('bills', I.list, 'Bills') + t('budget', I.pie, 'Budget') + t('calendar', I.cal, 'Calendar') + t('insights', I.chart, 'Insights');
 }
@@ -393,7 +398,7 @@ function incRow(x) {
 }
 function purRow(p, showDate = true) {
   const c = catIn('spend', p.catId);
-  return `<div class="row"><a class="hit" href="#/purchase/edit/${p.id}"><span class="dot" style="background:${c.color}"></span><span class="main"><span class="name">${esc(p.where || c.name)}</span><span class="sub">${esc(c.name)}${showDate ? ' · ' + shortDate(p.date) : ''}${p.note ? ' · ' + esc(p.note) : ''}</span></span><span class="end"><span class="amt">${fmt(+p.amount)}</span></span></a></div>`;
+  return `<div class="row"><a class="hit" href="#/purchase/edit/${p.id}"><span class="dot" style="background:${c.color}"></span><span class="main"><span class="name">${esc(p.where || c.name)}</span><span class="sub">${esc(c.name)}${subName(c, p.subId) ? ' › ' + esc(subName(c, p.subId)) : ''}${showDate ? ' · ' + shortDate(p.date) : ''}${p.note ? ' · ' + esc(p.note) : ''}</span></span><span class="end"><span class="amt">${fmt(+p.amount)}</span></span></a></div>`;
 }
 
 /* ---------- Home ---------- */
@@ -502,10 +507,11 @@ function spendNote(c, k) {
   const cur = mKey(todayS()) === k;
   if (!a && !sp) return { text: 'No budget set', color: 'var(--muted)' };
   if (!a && !cv) return { text: `No budget set · ${fmt(sp)} spent`, color: 'var(--muted)' };
-  if (sp > a + 0.005) return { text: `${fmt(sp - a)} over${c.rollover ? ' · comes out of next month' : ''}`, color: 'var(--late)' };
-  const pace = monthPace(sp, k);
-  if (cur && pace > a + 0.5 && a > 0 && pace !== sp) return { text: `On pace for ${fmt0(pace)} by month end`, color: 'var(--soon)' };
+  if (sp > a + 0.005) { const un = unplannedM(c, k); return { text: `${fmt(sp - a)} over${un > 0.004 ? ` · ${fmt(un)} unplanned` : ''}${c.rollover ? ' · comes out of next month' : ''}`, color: 'var(--late)' }; }
+  const pace = monthPace(sp, k), un = unplannedM(c, k);
+  if (cur && pace > a + 0.5 && a > 0 && pace !== sp) return { text: `On pace for ${fmt0(pace)} by month end${un > 0.004 ? ` · ${fmt(un)} unplanned` : ''}`, color: 'var(--soon)' };
   let t = `${fmt(a - sp)} left`;
+  if (un > 0.004) t += ` · ${fmt(un)} unplanned`;
   if (cv > 0.004) t += ` · includes ${fmt(cv)} carried over`;
   else if (cv < -0.004) t += ` · ${fmt(-cv)} overspent last month taken out`;
   return { text: t, color: 'var(--muted)' };
@@ -532,6 +538,7 @@ function budgetMonth(k) {
     </div>
     <span class="tiny muted">${inc ? `Based on expected income. ${fmt(received)} received so far.` : 'Add your income to start assigning it.'}</span></div>`;
   if (!budOf(k)) out += `<div class="note-warn">No budget for ${monthName(k)} yet. Start from ${monthName(prev)}’s, or tap a category below to set it.</div>`;
+  out += `<a class="btn outline" href="#/review" data-a="openreview">Review planned vs. actual ›</a>`;
   out += `<div class="chips"><button class="chip sm" data-a="qfill" data-v="copy">Copy ${monthShort(prev)} budget</button><button class="chip sm" data-a="qfill" data-v="actual">Use ${monthShort(prev)} actuals</button><button class="chip sm" data-a="qfill" data-v="avg">3-month average</button></div>`;
 
   // income
@@ -556,9 +563,21 @@ function budgetMonth(k) {
   out += `<section class="sec"><div class="sec-head"><span class="caps">Spending</span><span class="small muted">${fmt(spentAll)} of ${fmt(sp)} spent</span></div><div class="group">${db.spendCategories.map((c) => {
     const a = avail(c, k), s = spentM(c.id, k), n = spendNote(c, k);
     const w = a > 0 ? Math.min(100, s / a * 100) : s > 0 ? 100 : 0;
-    return `<button class="brow" data-a="budcat" data-id="${c.id}"><span class="top"><span class="nm"><i class="dot" style="background:${c.color}"></i>${esc(c.name)}${c.rollover ? '<span class="badge">Rolls over</span>' : ''}${c.period === 'week' ? '<span class="badge">Weekly</span>' : ''}</span><span style="white-space:nowrap"><b style="font-weight:600">${fmt(s)}</b> <span class="muted">of ${fmt(a)}</span></span></span><span class="bar6"><span style="display:block;height:100%;border-radius:3px;width:${w.toFixed(1)}%;background:${!a && !carry(c, k) ? '#5A6068' : s > a + 0.005 ? 'var(--late)' : c.color}"></span></span><span class="note" style="color:${n.color}">${n.text}</span></button>`;
+    return `<button class="brow" data-a="budcat" data-id="${c.id}"><span class="top"><span class="nm"><i class="dot" style="background:${c.color}"></i>${esc(c.name)}${c.rollover ? '<span class="badge">Rolls over</span>' : ''}${c.period === 'week' ? '<span class="badge">Weekly</span>' : ''}</span><span style="white-space:nowrap"><b style="font-weight:600">${fmt(s)}</b> <span class="muted">of ${fmt(a)}</span></span></span><span class="bar6"><span style="display:block;height:100%;border-radius:3px;width:${w.toFixed(1)}%;background:${!a && !carry(c, k) ? '#5A6068' : s > a + 0.005 ? 'var(--late)' : c.color}"></span></span><span class="note" style="color:${n.color}">${n.text}</span>${subRows(c, k)}</button>`;
   }).join('')}</div><div style="display:flex;justify-content:space-between;align-items:center"><button class="chip sm" data-a="newcat" data-list="spend">+ Add category</button><a class="small" href="#/purchases">All purchases ›</a></div></section>`;
   return out;
+}
+function subRows(c, k) {
+  const subs = subsOf(c); if (!subs.length) return '';
+  let sorted = 0;
+  const rows = subs.map((x) => {
+    const pl = subAmt(k, x.id), sp = subSpent(x.id, k); sorted += sp;
+    if (!pl) return sp > 0.004 ? `<span class="subrow"><span class="sr-top"><span>${esc(x.name)} <span class="c-soon tiny">unplanned</span></span><span><b style="font-weight:600">${fmt(sp)}</b></span></span></span>` : `<span class="subrow"><span class="sr-top muted"><span>${esc(x.name)}</span><span>not planned</span></span></span>`;
+    const w = Math.min(100, sp / pl * 100);
+    return `<span class="subrow"><span class="sr-top"><span>${esc(x.name)}</span><span><b style="font-weight:600">${fmt(sp)}</b> <span class="muted">of ${fmt(pl)}</span></span></span><span class="bar3"><span style="width:${w.toFixed(1)}%;background:${sp > pl + 0.005 ? 'var(--late)' : c.color}"></span></span></span>`;
+  }).join('');
+  const rest = r2(spentM(c.id, k) - sorted);
+  return `<span class="subrows">${rows}${rest > 0.005 ? `<span class="subrow"><span class="sr-top"><span class="muted">Not assigned to a part</span><span class="muted">${fmt(rest)}</span></span></span>` : ''}</span>`;
 }
 function budgetPaychecks(k) {
   const recurring = db.incomes.filter((x) => x.cadence !== 'once');
@@ -850,18 +869,44 @@ function saveIncome() {
 function afterLine(d) {
   const c = listOf('spend').find((x) => x.id === d.catId);
   if (!c || !isDate(d.date)) return '';
-  const k = mKey(d.date), a = avail(c, k);
-  let s = spentM(c.id, k) + (num(d.amount) || 0);
-  if (d.id) { const o = db.purchases.find((p) => p.id === d.id); if (o && o.catId === c.id && mKey(o.date) === k) s -= +o.amount; }
-  const left = r2(a - s);
-  if (!a) return `<span>${esc(c.name)}</span><span>No ${monthName(k)} budget set</span>`;
-  return `<span>${esc(c.name)} after this</span><span><b${left < 0 ? ' style="color:var(--late)"' : ''}>${fmt(Math.abs(left))} ${left < 0 ? 'over' : 'left'}</b> of ${fmt(a)}</span>`;
+  const k = mKey(d.date), amt = num(d.amount) || 0;
+  const o = d.id ? db.purchases.find((p) => p.id === d.id) : null;
+  const line = (label, a, spentNow) => {
+    const left = r2(a - spentNow - amt);
+    if (!a) return `<div class="infoline"><span>${esc(label)}</span><span>No ${monthName(k)} budget set</span></div>`;
+    return `<div class="infoline"><span>${esc(label)} after this</span><span><b${left < 0 ? ' style="color:var(--late)"' : ''}>${fmt(Math.abs(left))} ${left < 0 ? 'over' : 'left'}</b> of ${fmt(a)}</span></div>`;
+  };
+  let catSpent = spentM(c.id, k);
+  if (o && o.catId === c.id && mKey(o.date) === k) catSpent -= +o.amount;
+  let html = '';
+  const sb = subsOf(c).find((x) => x.id === d.subId);
+  if (sb) {
+    let ss = subSpent(sb.id, k);
+    if (o && o.subId === sb.id && mKey(o.date) === k) ss -= +o.amount;
+    html += subAmt(k, sb.id) ? line(sb.name, subAmt(k, sb.id), ss) : `<div class="infoline"><span>${esc(sb.name)}</span><span class="c-soon">Unplanned · ${fmt(ss + amt)} this month</span></div>`;
+  }
+  return html + line(c.name, avail(c, k), catSpent);
+}
+function defaultSub(catId) {
+  const c = listOf('spend').find((x) => x.id === catId), subs = subsOf(c);
+  if (!subs.length) return '';
+  const ids = new Set(subs.map((x) => x.id));
+  const last = db.purchases.slice().sort((a, z) => (z.created || 0) - (a.created || 0)).find((p) => p.catId === catId && ids.has(p.subId));
+  return last ? last.subId : subs[0].id;
+}
+function subChips(d) {
+  const c = listOf('spend').find((x) => x.id === d.catId), subs = subsOf(c);
+  if (!c) return '';
+  if (!subs.length) return `<button type="button" class="back" data-a="newsub" data-v="${c.id}" style="align-self:flex-start;height:32px;font-size:14px">+ Track ${esc(c.name)} by part (e.g. ${c.name === 'Animals' ? 'Pet food' : 'a store or item type'})</button>`;
+  const k = isDate(d.date) ? mKey(d.date) : mKey(todayS());
+  return `<div class="sec" style="gap:6px"><span class="small muted">Which part of ${esc(c.name)}?</span><div class="chips">${subs.map((x) => `<button type="button" class="chip sm" data-a="dset" data-k="subId" data-v="${x.id}" aria-pressed="${d.subId === x.id}">${esc(x.name)}${subAmt(k, x.id) ? '' : ' <span class="tiny" style="opacity:.7">· unplanned</span>'}</button>`).join('')}<button type="button" class="chip sm add" data-a="newsub" data-v="${c.id}">+ New part</button></div></div>`;
 }
 function vPurchase(id) {
   const ok = openDraft('pur:' + (id || 'new'), () => {
     if (id) { const p = db.purchases.find((x) => x.id === id); return p ? Object.assign(JSON.parse(JSON.stringify(p)), { amount: (+p.amount).toFixed(2), _touched: true }) : null; }
     const last = db.purchases.slice().sort((a, z) => (z.created || 0) - (a.created || 0))[0];
-    return { id: null, amount: '', catId: ui.purCat || last?.catId || db.spendCategories[0]?.id || '', date: todayS(), where: '', note: '' };
+    const catId = ui.purCat || last?.catId || db.spendCategories[0]?.id || '';
+    return { id: null, amount: '', catId, subId: defaultSub(catId), date: todayS(), where: '', note: '' };
   });
   if (!ok) return missing('purchase');
   const d = draft;
@@ -870,8 +915,9 @@ function vPurchase(id) {
     <div class="topbar"><a href="${backHref()}" style="font-size:16px;min-height:44px;display:flex;align-items:center">Cancel</a><h1 style="font-size:17px">${id ? 'Edit purchase' : 'Purchase'}</h1><button type="submit" class="btn primary sm">Save</button></div>
     ${d._err ? `<div class="err" role="alert">${esc(d._err)}</div>` : ''}
     <label class="amount-big">Amount<input id="f-pamt" data-d="amount" inputmode="decimal" value="${esc(d.amount)}" placeholder="$0.00" autocomplete="off"></label>
-    <fieldset class="sec" style="border:none;margin:0;padding:0"><legend class="small muted" style="padding:0;margin-bottom:8px">Spending category</legend>${catChips('spend', 'catId', d.catId)}
-      <div class="infoline" id="after-line">${afterLine(d)}</div></fieldset>
+    <fieldset class="sec" style="border:none;margin:0;padding:0"><legend class="small muted" style="padding:0;margin-bottom:8px">Spending category</legend>${catChips('spend', 'catId', d.catId)}</fieldset>
+    ${subChips(d)}
+    <div id="after-line" style="display:flex;flex-direction:column;gap:6px">${afterLine(d)}</div>
     <div class="grid2">
       <label class="field">Date<input id="f-pdate" type="date" data-d="date" value="${esc(d.date)}"></label>
       <label class="field">Where (optional)<input id="f-where" data-d="where" value="${esc(d.where)}" list="where-list" autocomplete="off" placeholder="Store"></label>
@@ -890,8 +936,10 @@ function savePurchase() {
   if (isNaN(amount) || amount <= 0) err = 'Enter the amount, like 42.18.';
   else if (!listOf('spend').some((c) => c.id === d.catId)) err = 'Pick a spending category.';
   else if (!isDate(d.date)) err = 'Pick the date.';
+  else if (subsOf(catIn('spend', d.catId)).length && !subsOf(catIn('spend', d.catId)).some((x) => x.id === d.subId)) err = `Pick which part of ${catIn('spend', d.catId).name} this was for.`;
   if (err) { d._err = err; render(); window.scrollTo(0, 0); return; }
   const p = { id: d.id || uid(), amount: r2(amount), catId: d.catId, date: d.date, where: d.where.trim(), note: d.note.trim(), created: d.created || Date.now() };
+  if (subsOf(catIn('spend', d.catId)).length) p.subId = d.subId;
   const i = db.purchases.findIndex((x) => x.id === p.id);
   if (i >= 0) db.purchases[i] = p; else db.purchases.push(p);
   save(); draft = null; draftFor = null;
@@ -1001,6 +1049,132 @@ function vInsights() {
     ${big.length ? `<section class="sec"><h2 class="muted">Big non-monthly bills ahead</h2><div class="rows">${big.map((i) => row(i, { sub: `${CAD[i.bill.cadence]} · ${shortDate(i.due)}` })).join('')}</div></section>` : ''}
     ${goals.length ? `<div class="card"><h2>Savings goals</h2>${goals.map((g) => { const b = goalBalance(g); return `<div class="bar-row"><div class="top"><span>${esc(g.name)}</span><span><b style="font-weight:600">${fmt(b)}</b>${g.target ? ` <span class="muted">of ${fmt(+g.target)}</span>` : ''}</span></div>${g.target ? `<div class="bar"><div style="width:${Math.min(100, Math.max(2, b / g.target * 100)).toFixed(1)}%;background:${g.color}"></div></div>` : ''}</div>`; }).join('')}</div>` : ''}
   </div>`;
+}
+
+/* ---------- Review: planned vs actual for any week, month or year ---------- */
+// Planned amount for a category/part over a date range: monthly plans prorated by days.
+function plannedIn(from, to, getM) {
+  let v = 0, m = mKey(from);
+  while (m <= mKey(to)) {
+    const a = from > mFirst(m) ? from : mFirst(m), z = to < mLast(m) ? to : mLast(m);
+    const days = diffDays(a, z) + 1;
+    if (days > 0) v += getM(m) * days / mDays(m);
+    m = mShift(m, 1);
+  }
+  return r2(v);
+}
+function unplannedM(c, k) { return sumBy(subsOf(c).filter((x) => !subAmt(k, x.id)), (x) => subSpent(x.id, k)); }
+function vReview() {
+  const mode = ui.revMode, P = periodOf(mode, ui.revDate), t = todayS();
+  const past = P.to < t, future = P.from > t, isMonth = mode === 'month', k = mKey(P.from);
+  const days = diffDays(P.from, P.to) + 1, el = past ? days : future ? 0 : diffDays(P.from, t) + 1, frac = el / days;
+  const soEnd = P.to < t ? P.to : t;
+  const seg = (v, l) => `<button data-a="revmode" data-v="${v}" aria-pressed="${mode === v}">${l}</button>`;
+  const actualLbl = past ? 'Actual' : 'So far';
+  const diffCell = (plan, act, good = 'under') => {
+    const d = r2(plan - act);
+    if (Math.abs(d) < 0.005) return '<span class="muted">on plan</span>';
+    if (good === 'under') return d > 0 ? `<span class="c-paid">${fmt(d)} under</span>` : `<span class="c-late">${fmt(-d)} over</span>`;
+    return d > 0 ? `<span class="c-soon">${fmt(d)} short</span>` : `<span class="c-paid">${fmt(-d)} extra</span>`;
+  };
+  // overview
+  const inc = counted(incInstances(P.from, P.to));
+  const incPlan = sumBy(inc, (i) => (i.status === 'received' ? +i.inc.amount : i.amount));
+  const incAct = sumBy(inc.filter((i) => i.status === 'received'), (i) => i.amount);
+  const bl = counted(instances(P.from, P.to));
+  const billPlan = sumBy(bl, (i) => share(i.bill)), billAct = sumBy(bl.filter((i) => i.status === 'paid'), (i) => i.amount);
+  const savPlan = isMonth ? savTotal(k) : plannedIn(P.from, P.to, savTotal), savAct = future ? 0 : sumBy(trIn(P.from, soEnd), (x) => +x.amount);
+  const cats = db.spendCategories.map((c) => {
+    const plan = isMonth ? avail(c, k) : plannedIn(P.from, P.to, (m) => bAmt(m, c.id));
+    const act = future ? 0 : spent(c.id, P.from, soEnd);
+    const subs = subsOf(c).map((x) => {
+      const sp = isMonth ? subAmt(k, x.id) : plannedIn(P.from, P.to, (m) => subAmt(m, x.id));
+      const sa = future ? 0 : sumBy(purIn(P.from, soEnd, c.id).filter((p) => p.subId === x.id), (p) => +p.amount);
+      return { x, plan: sp, act: sa };
+    });
+    const unassigned = r2(act - sumBy(subs, (s) => s.act));
+    return { c, plan, act, subs, unassigned, carry: isMonth ? carry(c, k) : 0 };
+  }).filter((r) => r.plan || r.act);
+  const spPlan = sumBy(cats, (r) => r.plan), spAct = sumBy(cats, (r) => r.act);
+  const unplannedTot = sumBy(cats, (r) => r.plan ? sumBy(r.subs.filter((s) => !s.plan), (s) => s.act) : r.act);
+  const row = (lbl, color, plan, act, good) => `<div class="rv"><span class="k"><i class="sq" style="background:${color}"></i>${lbl}</span><span>${fmt(plan)}</span><span>${fmt(act)}</span><span class="d">${diffCell(plan, act, good)}</span></div>`;
+  let out = `<div class="card" style="gap:10px">
+    <div class="rv head"><span></span><span>Planned</span><span>${actualLbl}</span><span></span></div>
+    ${row('Income', GREEN, incPlan, incAct, 'over')}
+    ${row('Bills', '#F2C46D', billPlan, billAct, 'under')}
+    ${row('Savings', '#B9A3FF', savPlan, savAct, 'over')}
+    ${row('Spending', '#8FB3FF', spPlan, spAct, 'under')}
+    ${!past && !future ? `<span class="tiny muted">${actualLbl} = through today (${Math.round(frac * 100)}% of the ${mode}). Planned is the full ${mode}.</span>` : ''}
+  </div>`;
+  // spending headline with pace
+  if (spPlan || spAct) {
+    const toDate = r2(spPlan * frac);
+    let pace = '';
+    if (!past && !future && spPlan) pace = spAct > toDate + 0.5 ? `<div class="note-warn">Ahead of plan: by today you’d expect about ${fmt(toDate)} spent, and you’ve spent ${fmt(spAct)}.</div>` : `<div class="note-good">On track: by today you’d expect about ${fmt(toDate)} spent, and you’ve spent ${fmt(spAct)}.</div>`;
+    else if (past && spPlan) pace = spAct <= spPlan + 0.005 ? `<div class="note-good">You stayed ${fmt(spPlan - spAct)} under your spending plan.</div>` : `<div class="note-warn">You went ${fmt(spAct - spPlan)} over your spending plan.</div>`;
+    out += `<div class="card" style="gap:10px"><div class="sec-head"><h2>Spending vs. plan</h2><span class="small">${fmt(spAct)} <span class="muted">of ${fmt(spPlan)}</span></span></div>
+      <div class="bar" style="position:relative"><div style="width:${spPlan ? Math.min(100, spAct / spPlan * 100).toFixed(1) : 100}%;background:${spAct > spPlan + 0.005 ? 'var(--late)' : '#8FB3FF'}"></div>${!past && !future && spPlan ? `<i class="pace-mark" style="left:${(frac * 100).toFixed(1)}%"></i>` : ''}</div>
+      ${!past && !future && spPlan ? '<span class="tiny muted">The white tick is where you’d be by today if spending were even.</span>' : ''}
+      ${unplannedTot > 0.005 ? `<span class="small c-soon">${fmt(unplannedTot)} of this was unplanned spending.</span>` : ''}
+      ${pace}</div>`;
+  }
+  // per category, with parts
+  out += `<section class="sec"><span class="caps">By category</span>${cats.length ? `<div class="group">${cats.map((r) => {
+    const over = r.act > r.plan + 0.005;
+    const w = r.plan ? Math.min(100, r.act / r.plan * 100) : 100;
+    const parts = r.subs.filter((s) => s.plan || s.act).map((s) => `<div class="rvsub"><span>${esc(s.x.name)}${!s.plan ? ' <span class="badge" style="color:var(--soon);border-color:var(--soon)">Unplanned</span>' : ''}</span><span>${fmt(s.act)} <span class="muted">of ${fmt(s.plan)}</span></span><span class="d">${s.plan ? diffCell(s.plan, s.act) : ''}</span></div>`).join('')
+      + (r.subs.length && r.unassigned > 0.005 ? `<div class="rvsub"><span class="muted">Not assigned to a part</span><span>${fmt(r.unassigned)}</span><span></span></div>` : '');
+    return `<div class="brow" style="cursor:default"><span class="top"><span class="nm"><i class="dot" style="background:${r.c.color}"></i>${esc(r.c.name)}${!r.plan ? '<span class="badge" style="color:var(--soon);border-color:var(--soon)">Unplanned</span>' : ''}</span><span style="white-space:nowrap"><b style="font-weight:600">${fmt(r.act)}</b> <span class="muted">of ${fmt(r.plan)}</span></span></span>
+      <span class="bar6"><span style="display:block;height:100%;border-radius:3px;width:${w.toFixed(1)}%;background:${over ? 'var(--late)' : r.c.color}"></span></span>
+      <span class="note">${r.plan ? diffCell(r.plan, r.act) : 'No plan for this category'}${r.carry > 0.004 ? ` · plan includes ${fmt(r.carry)} carried in` : r.carry < -0.004 ? ` · plan reduced ${fmt(-r.carry)} by last month’s overspending` : ''}</span>
+      ${parts ? `<span class="rvsubs">${parts}</span>` : ''}</div>`;
+  }).join('')}</div>` : '<div class="none">No spending planned or logged for this period.</div>'}</section>`;
+  // savings goals
+  const goals = db.goals.map((g) => ({ g, plan: isMonth ? sAmt(k, g.id) : plannedIn(P.from, P.to, (m) => sAmt(m, g.id)), act: future ? 0 : sumBy(trIn(P.from, soEnd, g.id), (x) => +x.amount) })).filter((r) => r.plan || r.act);
+  if (goals.length) out += `<section class="sec"><span class="caps">Savings goals</span><div class="group">${goals.map((r) => `<div class="brow" style="cursor:default"><span class="top"><span class="nm"><i class="dot" style="background:${r.g.color}"></i>${esc(r.g.name)}</span><span><b style="font-weight:600">${fmt(r.act)}</b> <span class="muted">of ${fmt(r.plan)}</span></span></span><span class="note">${diffCell(r.plan, r.act, 'over')}</span></div>`).join('')}</div></section>`;
+  return `<div class="screen">
+    <a class="back" href="#/budget">${I.left}Budget</a>
+    <div class="head" style="align-items:center"><h1>Review</h1><div style="display:flex;align-items:center"><button class="icon-btn plain" data-a="revnav" data-v="-1" aria-label="Previous">${I.left}</button><span style="font-size:15px;font-weight:600;min-width:84px;text-align:center">${P.label}</span><button class="icon-btn plain" data-a="revnav" data-v="1" aria-label="Next">${I.right}</button></div></div>
+    <div class="seg" role="group" aria-label="Period" style="grid-template-columns:repeat(3,minmax(0,1fr))">${seg('week', 'Week')}${seg('month', 'Month')}${seg('year', 'Year')}</div>
+    ${out}
+    ${mode !== 'month' ? '<span class="hint">Week and year plans are your monthly plans spread evenly by day. Rollover only applies to monthly plans.</span>' : ''}
+  </div>`;
+}
+
+/* New part (sub-budget) created while logging a purchase: starts with $0 planned. */
+function subDialog(catId) {
+  const c = db.spendCategories.find((x) => x.id === catId); if (!c) return;
+  sheet = { type: 'sub', id: c.id, focus: '#sub-name' };
+  const first = !subsOf(c).length;
+  openSheet(`<form id="sub-form" style="display:flex;flex-direction:column;gap:16px" novalidate>
+    <h2 style="font-size:20px;font-weight:700">New part of ${esc(c.name)}</h2>
+    <label class="field">Name<input id="sub-name" name="name" placeholder="e.g. Dog park" autocomplete="off"></label>
+    <span class="hint">It starts with $0 planned, so your ${esc(c.name)} budget doesn’t change. Spending here shows as unplanned until you plan for it in Budget.${first ? ` Your current ${esc(c.name)} budget becomes a part called “General”.` : ''}</span>
+    <div class="err" id="sub-err" role="alert"></div>
+    ${sheetBtns('Add part')}
+  </form>`);
+}
+function addSub(c, name) {
+  if (!subsOf(c).length) {
+    // Keep the category total the same: existing plans move into a "General" part.
+    if (name.toLowerCase() !== 'general') {
+      const g = { id: uid(), name: 'General' };
+      c.subs = [g];
+      for (const [k, b] of Object.entries(db.budgets)) if (+b.spend[c.id]) { b.sub = b.sub || {}; b.sub[g.id] = +b.spend[c.id]; }
+    } else c.subs = [];
+  }
+  const s = { id: uid(), name };
+  c.subs.push(s);
+  return s;
+}
+function submitSub(form) {
+  const c = db.spendCategories.find((x) => x.id === sheet.id); if (!c) return closeSheet();
+  const name = String(new FormData(form).get('name') || '').trim();
+  if (!name) { $('#sub-err').textContent = 'Give the part a name.'; return; }
+  if (subsOf(c).some((x) => x.name.toLowerCase() === name.toLowerCase())) { $('#sub-err').textContent = `${c.name} already has a part with that name.`; return; }
+  const s = addSub(c, name);
+  if (draft) { draft.catId = c.id; draft.subId = s.id; draft._touched = true; }
+  save(); closeSheet(); render();
 }
 
 /* ---------- Settings ---------- */
@@ -1169,38 +1343,84 @@ function submitTr(form) {
   save(); closeSheet(); toast(v < 0 ? 'Taken out of savings' : `${fmt(v)} moved to ${catIn('goal', rec.goalId).name}`); render();
 }
 
+/* Spending-category budget sheet, with optional sub-budgets (e.g. Animals › Pet food, Vet, Other). */
 function budcatDialog(catId) {
   const c = db.spendCategories.find((x) => x.id === catId); if (!c) return;
-  const k = ui.budMonth, prev = mShift(k, -1);
-  const monthly = bAmt(k, c.id);
-  sheet = { type: 'bud', id: c.id, period: c.period, roll: c.rollover };
-  const prevBud = bAmt(prev, c.id), prevAct = spentM(c.id, prev);
-  const avg3 = r2((spentM(c.id, prev) + spentM(c.id, mShift(k, -2)) + spentM(c.id, mShift(k, -3))) / 3);
+  const k = ui.budMonth;
+  const disp = (m) => (m ? (c.period === 'week' ? weeklyOf(m, k) : m).toFixed(2) : '');
+  sheet = { type: 'bud', id: c.id, period: c.period, roll: c.rollover, err: '',
+    main: disp(bAmt(k, c.id)),
+    rows: subsOf(c).map((s) => ({ id: s.id, name: s.name, val: disp(subAmt(k, s.id)) })) };
+  renderBudSheet();
+}
+function captureBud() {
+  const m = $('#bud-amt'); if (m) sheet.main = m.value;
+  document.querySelectorAll('#bud-form [data-row]').forEach((el) => { sheet.rows[+el.dataset.row][el.dataset.f] = el.value; });
+}
+function rowsTotal() { return r2(sheet.rows.reduce((a, r) => a + (num(r.val) || 0), 0)); }
+function renderBudSheet(focusSel) {
+  const c = db.spendCategories.find((x) => x.id === sheet.id); if (!c) return closeSheet();
+  const k = ui.budMonth, prev = mShift(k, -1), wk = sheet.period === 'week', hasRows = sheet.rows.length > 0;
+  const months3 = [prev, mShift(k, -2), mShift(k, -3)];
   const sp = spentM(c.id, k), n = purIn(mFirst(k), mLast(k), c.id).length;
-  const shown = c.period === 'week' ? weeklyOf(monthly, k) : monthly;
   const cur = mKey(todayS()) === k, pace = monthPace(sp, k);
-  const sug = (lbl, v) => `<div class="sugg"><span>${lbl}</span><span class="v">${fmt(v)}<button type="button" data-a="buduse" data-v="${v}">Use</button></span></div>`;
+  const per = wk ? 'per week' : 'for ' + monthName(k);
+  // suggestions: whole category, or each part when there are sub-budgets
+  const sugTot = { pbud: bAmt(prev, c.id), pact: spentM(c.id, prev), avg: r2(months3.reduce((a, m) => a + spentM(c.id, m), 0) / 3) };
+  const sug = (kind, lbl) => `<div class="sugg"><span>${lbl}</span><span class="v">${fmt(sugTot[kind])}<button type="button" data-a="buduse" data-v="${kind}">Use</button></span></div>`;
+  const rowsHtml = sheet.rows.map((r, i) => {
+    const spentSub = r.id ? subSpent(r.id, k) : 0;
+    return `<div class="subedit"><input data-row="${i}" data-f="name" value="${esc(r.name)}" placeholder="Name, e.g. Pet food" aria-label="Sub-budget name" autocomplete="off"><input data-row="${i}" data-f="val" value="${esc(r.val)}" inputmode="decimal" placeholder="0.00" aria-label="${esc(r.name || 'Sub-budget')} amount ${per}"><button type="button" class="subdel" data-a="subdel" data-v="${i}" aria-label="Remove ${esc(r.name || 'sub-budget')}">×</button>${r.id ? `<span class="tiny muted subspent">${fmt(spentSub)} spent in ${monthShort(k)}${hist(r.id, prev, months3)}</span>` : ''}</div>`;
+  }).join('');
+  const unsorted = hasRows ? r2(sp - sheet.rows.reduce((a, r) => a + (r.id ? subSpent(r.id, k) : 0), 0)) : 0;
   openSheet(`<form id="bud-form" style="display:flex;flex-direction:column;gap:16px" novalidate>
     <div class="sec-head"><h2 style="font-size:20px;font-weight:700;display:flex;align-items:center;gap:10px"><span class="dot" style="width:12px;height:12px;border-radius:6px;background:${c.color}"></span>${esc(c.name)}</h2><span class="small muted">${fmt(sp)} spent · ${plural(n, 'purchase')}</span></div>
-    <div class="seg on-s2" role="group" aria-label="Budget period" style="grid-template-columns:repeat(2,minmax(0,1fr))"><button type="button" data-a="budper" data-v="week" aria-pressed="${c.period === 'week'}">Per week</button><button type="button" data-a="budper" data-v="month" aria-pressed="${c.period !== 'week'}">Per month</button></div>
-    <label class="field"><span id="bud-lbl">${c.period === 'week' ? 'Budget per week' : 'Budget for ' + monthName(k)}</span><input id="bud-amt" name="amount" inputmode="decimal" value="${shown ? shown.toFixed(2) : ''}" placeholder="0.00" style="height:52px;font-size:22px;font-weight:700"></label>
-    <span class="hint" id="bud-conv">${budConv(shown, c.period, k)}</span>
-    <div class="sec"><span class="small muted">Suggestions from your history (monthly)</span><div class="group dark">${sug(monthName(prev) + ' budget', prevBud)}${sug(monthName(prev) + ' actual', prevAct)}${sug('3-month average', avg3)}</div>
+    <div class="seg on-s2" role="group" aria-label="Budget period" style="grid-template-columns:repeat(2,minmax(0,1fr))"><button type="button" data-a="budper" data-v="week" aria-pressed="${wk}">Per week</button><button type="button" data-a="budper" data-v="month" aria-pressed="${!wk}">Per month</button></div>
+    ${hasRows
+      ? `<div class="infoline" style="font-size:15px"><span>Total ${per}</span><b id="bud-total">${fmt(rowsTotal())}</b></div>`
+      : `<label class="field"><span>Budget ${per}</span><input id="bud-amt" name="amount" inputmode="decimal" value="${esc(sheet.main)}" placeholder="0.00" style="height:52px;font-size:22px;font-weight:700"></label>`}
+    <span class="hint" id="bud-conv">${budConv(hasRows ? rowsTotal() : sheet.main, sheet.period, k)}</span>
+    <div class="sec"><div class="sec-head"><span class="small muted">Break it down (optional)</span>${hasRows ? `<span class="tiny muted">${wk ? 'weekly' : 'monthly'} amounts</span>` : ''}</div>
+      ${hasRows ? `<div class="subs-edit">${rowsHtml}</div>` : '<span class="hint">Split this budget into parts, like Pet food, Vet and Other. Purchases then get logged to a part, and the total is the sum of the parts.</span>'}
+      ${unsorted > 0.005 ? `<span class="hint">${fmt(unsorted)} of ${monthName(k)} purchases aren’t assigned to a part yet. Open them from See purchases to sort them.</span>` : ''}
+      <button type="button" class="chip sm" data-a="subadd" style="align-self:flex-start">+ Add ${hasRows ? 'another part' : 'sub-budget'}</button>
+    </div>
+    <div class="sec"><span class="small muted">Suggestions from your history (monthly${hasRows ? ', filled in for each part' : ''})</span><div class="group dark">${sug('pbud', monthName(prev) + ' budget')}${sug('pact', monthName(prev) + ' actual')}${sug('avg', '3-month average')}</div>
       ${cur ? `<span class="hint">Projected for ${monthName(k)} at your current pace: <b style="color:var(--text)">${fmt0(pace)}</b></span>` : ''}</div>
-    <div class="sec"><span class="small muted">At month end</span><div class="seg on-s2" role="group" aria-label="At month end" style="grid-template-columns:repeat(2,minmax(0,1fr))"><button type="button" data-a="budroll" data-v="0" aria-pressed="${!c.rollover}">Start fresh</button><button type="button" data-a="budroll" data-v="1" aria-pressed="${c.rollover}">Roll over</button></div><span class="hint">Roll over carries leftover money, or overspending, into next month.</span></div>
+    <div class="sec"><span class="small muted">At month end</span><div class="seg on-s2" role="group" aria-label="At month end" style="grid-template-columns:repeat(2,minmax(0,1fr))"><button type="button" data-a="budroll" data-v="0" aria-pressed="${!sheet.roll}">Start fresh</button><button type="button" data-a="budroll" data-v="1" aria-pressed="${sheet.roll}">Roll over</button></div><span class="hint">Roll over carries leftover money, or overspending, into next month.</span></div>
+    <div class="err" id="bud-err" role="alert">${esc(sheet.err)}</div>
     <div class="grid2"><button type="button" class="btn" data-a="go" data-v="#/purchases/${c.id}">See purchases</button><button type="submit" class="btn primary">Save</button></div>
     <button type="button" class="back" data-a="editcat" data-list="spend" data-id="${c.id}" style="align-self:center">Rename or recolor ›</button>
   </form>`);
+  if (focusSel) setTimeout(() => { const f = $(focusSel); if (f) f.focus(); }, 50);
+}
+function hist(subId, prev, months3) {
+  const a = subSpent(subId, prev), avg = r2(months3.reduce((s, m) => s + subSpent(subId, m), 0) / 3);
+  return a || avg ? ` · ${monthShort(prev)} ${fmt0(a)} · 3-mo avg ${fmt0(avg)}` : '';
 }
 function budConv(v, period, k) {
   v = num(v); if (isNaN(v) || !v) return '';
   return period === 'week' ? `About ${fmt(monthlyOf(v, k))} for ${monthName(k)}` : `About ${fmt(weeklyOf(v, k))} a week`;
 }
-function submitBud(form) {
+function submitBud() {
   const c = db.spendCategories.find((x) => x.id === sheet.id); if (!c) return closeSheet();
-  const k = ui.budMonth, v = num(new FormData(form).get('amount'));
-  const monthly = isNaN(v) ? 0 : sheet.period === 'week' ? monthlyOf(v, k) : r2(v);
-  ensureBud(k).spend[c.id] = Math.max(0, monthly);
+  captureBud();
+  const k = ui.budMonth, toM = (v) => { v = num(v); return isNaN(v) || v < 0 ? 0 : sheet.period === 'week' ? monthlyOf(v, k) : r2(v); };
+  const rows = sheet.rows.filter((r) => r.name.trim() || num(r.val));
+  if (rows.some((r) => !r.name.trim())) { sheet.err = 'Give each part a name.'; renderBudSheet(); return; }
+  const names = rows.map((r) => r.name.trim().toLowerCase());
+  if (new Set(names).size !== names.length) { sheet.err = 'Two parts have the same name.'; renderBudSheet(); return; }
+  const b = ensureBud(k);
+  const keep = new Set();
+  if (rows.length) {
+    c.subs = rows.map((r) => { const id = r.id || uid(); keep.add(id); b.sub[id] = toM(r.val); return { id, name: r.name.trim() }; });
+    b.spend[c.id] = r2(c.subs.reduce((a, s) => a + b.sub[s.id], 0));
+  } else {
+    c.subs = [];
+    b.spend[c.id] = toM(sheet.main);
+  }
+  // purchases tied to a removed part become "not assigned"
+  db.purchases.forEach((p) => { if (p.catId === c.id && p.subId && !keep.has(p.subId)) delete p.subId; });
   c.period = sheet.period; c.rollover = sheet.roll;
   save(); closeSheet(); render();
 }
@@ -1311,9 +1531,9 @@ function submitCat(form) {
   if (list.some((c) => c.id !== sheet.id && c.name.toLowerCase() === name.toLowerCase())) { $('#cat-err').textContent = 'That name is already in this list.'; return; }
   let id = sheet.id, c;
   if (id) { c = list.find((x) => x.id === id); Object.assign(c, { name, color: sheet.color }); }
-  else { id = uid(); c = { id, name, color: sheet.color }; if (L === 'spend') Object.assign(c, { period: 'month', rollover: false }); list.push(c); }
+  else { id = uid(); c = { id, name, color: sheet.color }; if (L === 'spend') Object.assign(c, { period: 'month', rollover: false, subs: [] }); list.push(c); }
   if (L === 'goal') { c.target = Math.max(0, r2(num(f.get('target')) || 0)); c.start = r2(num(f.get('start')) || 0); }
-  if (sheet.fromDraft && draft) { if (L === 'spend') { draft.catId = id; draft._touched = true; } else draft.categoryId = id; }
+  if (sheet.fromDraft && draft) { if (L === 'spend') { draft.catId = id; draft.subId = ''; draft._touched = true; } else draft.categoryId = id; }
   save(); closeSheet(); render();
 }
 function deleteCat() {
@@ -1324,7 +1544,7 @@ function deleteCat() {
     if (L === 'bill') db.bills.forEach((b) => { if (b.categoryId === c.id) b.categoryId = mv; });
     if (L === 'income') db.incomes.forEach((x) => { if (x.categoryId === c.id) x.categoryId = mv; });
     if (L === 'spend') {
-      db.purchases.forEach((p) => { if (p.catId === c.id) p.catId = mv; });
+      db.purchases.forEach((p) => { if (p.catId === c.id) { p.catId = mv; delete p.subId; } });
       for (const b of Object.values(db.budgets)) if (b.spend[c.id]) { b.spend[mv] = r2((+b.spend[mv] || 0) + +b.spend[c.id]); delete b.spend[c.id]; }
     }
     if (L === 'goal') {
@@ -1341,25 +1561,36 @@ function deleteCat() {
 function quickFill(kind) {
   const k = ui.budMonth, prev = mShift(k, -1), cur = budOf(k);
   const hasAny = cur && (Object.values(cur.spend).some((v) => +v) || Object.values(cur.savings).some((v) => +v));
-  let spend = {}, savings = cur ? Object.assign({}, cur.savings) : {}, msg = '';
+  let spend = {}, sub = {}, savings = cur ? Object.assign({}, cur.savings) : {}, msg = '';
   if (kind === 'copy') {
     const p = budOf(prev);
     if (!p) { toast(`There’s no ${monthName(prev)} budget to copy`); return; }
-    spend = Object.assign({}, p.spend); savings = Object.assign({}, p.savings);
+    spend = Object.assign({}, p.spend); savings = Object.assign({}, p.savings); sub = Object.assign({}, p.sub || {});
     msg = `Copied ${monthName(prev)}’s budget`;
   } else {
     const months = kind === 'avg' ? [1, 2, 3].map((n) => mShift(k, -n)) : [prev];
+    const avgOf = (f) => r2(months.reduce((a, m) => a + f(m), 0) / months.length);
     let any = false;
     for (const c of db.spendCategories) {
-      const v = r2(months.reduce((a, m) => a + spentM(c.id, m), 0) / months.length);
-      if (v) { spend[c.id] = Math.ceil(v); any = true; }
+      const total = avgOf((m) => spentM(c.id, m));
+      if (total) any = true;
+      const subs = subsOf(c);
+      if (!subs.length) { if (total) spend[c.id] = Math.ceil(total); continue; }
+      let sumSubs = 0;
+      for (const sb of subs) { const v = avgOf((m) => subSpent(sb.id, m)); sub[sb.id] = v; sumSubs += v; }
+      // Spending not assigned to a part goes to a part named "Other" (or the last part).
+      const rest = r2(total - sumSubs);
+      if (rest > 0) { const o = subs.find((x) => x.name.trim().toLowerCase() === 'other') || subs[subs.length - 1]; sub[o.id] += rest; }
+      let t = 0;
+      for (const sb of subs) { sub[sb.id] = Math.ceil(sub[sb.id]); t += sub[sb.id]; }
+      spend[c.id] = t;
     }
     if (!any) { toast(`No purchases logged in ${kind === 'avg' ? 'the last 3 months' : monthName(prev)}`); return; }
     if (!cur && budOf(prev)) savings = Object.assign({}, budOf(prev).savings);
     msg = kind === 'avg' ? 'Filled from your 3-month average spending' : `Filled from ${monthName(prev)}’s actual spending`;
   }
   if (hasAny && !confirm(`Replace ${monthName(k)}’s spending budget?`)) return;
-  db.budgets[k] = { spend, savings };
+  db.budgets[k] = { spend, savings, sub };
   save(); toast(msg); render();
 }
 
@@ -1433,7 +1664,7 @@ const actions = {
   edittr(el) { transferDialog(null, el.dataset.id); },
   deltr() { if (!confirm('Delete this savings move?')) return; db.transfers = db.transfers.filter((x) => x.id !== sheet.trId); save(); closeSheet(); render(); },
   closesheet() { closeSheet(); },
-  dset(el) { if (!draft) return; captureDraft(); setPath(draft, el.dataset.k, el.dataset.v); if (el.dataset.k === 'catId') draft._touched = true; if (el.dataset.k === 'cadence' && el.dataset.v !== 'once') draft._sched = el.dataset.v; render(); },
+  dset(el) { if (!draft) return; captureDraft(); setPath(draft, el.dataset.k, el.dataset.v); if (el.dataset.k === 'catId') { draft._touched = true; draft.subId = defaultSub(el.dataset.v); } if (el.dataset.k === 'cadence' && el.dataset.v !== 'once') draft._sched = el.dataset.v; render(); },
   inctype(el) { if (!draft) return; captureDraft(); draft.cadence = el.dataset.v === 'once' ? 'once' : (draft._sched || 'biweekly'); render(); },
   newcat(el) { if (el.dataset.draft && draft) captureDraft(); catDialog(el.dataset.list, null, !!el.dataset.draft); },
   editcat(el) { catDialog(el.dataset.list, el.dataset.id, false); },
@@ -1465,17 +1696,45 @@ const actions = {
   qfill(el) { quickFill(el.dataset.v); },
   budper(el) {
     if (sheet.period === el.dataset.v) return;
-    const inp = $('#bud-amt'), v = num(inp.value), k = ui.budMonth;
-    sheet.period = el.dataset.v; segPress(el);
-    if (!isNaN(v)) inp.value = (sheet.period === 'week' ? weeklyOf(v, k) : monthlyOf(v, k)).toFixed(2);
-    $('#bud-lbl').textContent = sheet.period === 'week' ? 'Budget per week' : 'Budget for ' + monthName(k);
-    $('#bud-conv').textContent = budConv(inp.value, sheet.period, k);
+    captureBud();
+    const k = ui.budMonth, conv = (v) => { v = num(v); return isNaN(v) ? v : (el.dataset.v === 'week' ? weeklyOf(v, k) : monthlyOf(v, k)).toFixed(2); };
+    sheet.period = el.dataset.v;
+    if (sheet.main !== '') sheet.main = conv(sheet.main);
+    sheet.rows.forEach((r) => { if (r.val !== '' && !isNaN(num(r.val))) r.val = conv(r.val); });
+    renderBudSheet();
   },
   buduse(el) {
-    const k = ui.budMonth, v = +el.dataset.v, inp = $('#bud-amt');
-    inp.value = (sheet.period === 'week' ? weeklyOf(v, k) : v).toFixed(2);
-    $('#bud-conv').textContent = budConv(inp.value, sheet.period, k);
+    captureBud();
+    const k = ui.budMonth, prev = mShift(k, -1), kind = el.dataset.v, months3 = [prev, mShift(k, -2), mShift(k, -3)];
+    const show = (m) => (sheet.period === 'week' ? weeklyOf(m, k) : m).toFixed(2);
+    const c = db.spendCategories.find((x) => x.id === sheet.id);
+    const val = (subId) => {
+      if (kind === 'pbud') return subId ? subAmt(prev, subId) : bAmt(prev, c.id);
+      if (kind === 'pact') return subId ? subSpent(subId, prev) : spentM(c.id, prev);
+      return r2(months3.reduce((a, m) => a + (subId ? subSpent(subId, m) : spentM(c.id, m)), 0) / 3);
+    };
+    if (sheet.rows.length) sheet.rows.forEach((r) => { if (r.id) r.val = show(val(r.id)); });
+    else sheet.main = show(val(null));
+    renderBudSheet();
   },
+  newsub(el) { if (draft) captureDraft(); subDialog(el.dataset.v); },
+  openreview() { ui.revMode = 'month'; ui.revDate = ui.budMonth === mKey(todayS()) ? todayS() : mFirst(ui.budMonth); location.hash = '#/review'; },
+  revmode(el) { ui.revMode = el.dataset.v; render(); },
+  revnav(el) {
+    const n = +el.dataset.v, m = ui.revMode;
+    ui.revDate = m === 'year' ? addMonths(ui.revDate, 12 * n) : m === 'month' ? addMonths(monthStart(ui.revDate), n, 1) : addDays(ui.revDate, 7 * n);
+    render();
+  },
+  subadd() {
+    captureBud();
+    if (!sheet.rows.length) {
+      // Start the breakdown with what's already budgeted, so nothing is lost.
+      sheet.rows.push({ id: null, name: '', val: sheet.main });
+    } else sheet.rows.push({ id: null, name: '', val: '' });
+    sheet.err = '';
+    renderBudSheet(`#bud-form [data-row="${sheet.rows.length - 1}"][data-f="name"]`);
+  },
+  subdel(el) { captureBud(); const r = sheet.rows.splice(+el.dataset.v, 1)[0]; if (!sheet.rows.length) sheet.main = r.val; renderBudSheet(); },
   budroll(el) { sheet.roll = el.dataset.v === '1'; segPress(el); },
   setlist(el) { ui.setList = el.dataset.v; render(); },
   calmode(el) { ui.calMode = el.dataset.v; if (ui.calMode === 'day') ui.calDate = ui.calSel; render(); },
@@ -1527,6 +1786,11 @@ document.addEventListener('input', (e) => {
   }
   if (el.id === 'hex' && sheet && sheet.type === 'cat') { const v = el.value.trim(); if (/^#?[0-9a-f]{6}$/i.test(v)) setColor(v[0] === '#' ? v : '#' + v, { fromHex: true }); return; }
   if (el.id === 'bud-amt' && sheet) { $('#bud-conv').textContent = budConv(el.value, sheet.period, ui.budMonth); return; }
+  if (el.dataset.row != null && sheet && sheet.type === 'bud') {
+    sheet.rows[+el.dataset.row][el.dataset.f] = el.value;
+    const t = $('#bud-total'); if (t) { t.textContent = fmt(rowsTotal()); $('#bud-conv').textContent = budConv(rowsTotal(), sheet.period, ui.budMonth); }
+    return;
+  }
   if (el.dataset.d && draft) {
     setPath(draft, el.dataset.d, el.type === 'checkbox' ? el.checked : el.value);
     const yp = $('#you-pay'); if (yp) yp.innerHTML = youPayText(draft);
@@ -1534,7 +1798,7 @@ document.addEventListener('input', (e) => {
     if (el.dataset.d === 'where' && !draft._touched) {
       const w = el.value.trim().toLowerCase();
       const last = w && db.purchases.slice().sort((a, z) => (z.created || 0) - (a.created || 0)).find((p) => (p.where || '').trim().toLowerCase() === w);
-      if (last && last.catId !== draft.catId) { draft.catId = last.catId; render(); return; }
+      if (last && (last.catId !== draft.catId || (last.subId && last.subId !== draft.subId))) { draft.catId = last.catId; draft.subId = last.subId && subsOf(catIn('spend', last.catId)).some((x) => x.id === last.subId) ? last.subId : defaultSub(last.catId); render(); return; }
     }
     const al = $('#after-line'); if (al) al.innerHTML = afterLine(draft);
   }
@@ -1555,9 +1819,10 @@ document.addEventListener('submit', (e) => {
   else if (f.id === 'pay-form') submitPay(f);
   else if (f.id === 'rec-form') submitRec(f);
   else if (f.id === 'tr-form') submitTr(f);
-  else if (f.id === 'bud-form') submitBud(f);
+  else if (f.id === 'bud-form') submitBud();
   else if (f.id === 'goal-form') submitGoal(f);
   else if (f.id === 'cat-form') submitCat(f);
+  else if (f.id === 'sub-form') submitSub(f);
 });
 document.addEventListener('pointerdown', (e) => {
   const t = e.target.closest('#sv, #hue'); if (!t) return;

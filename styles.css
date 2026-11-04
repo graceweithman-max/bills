@@ -243,3 +243,28 @@ a.chip[aria-pressed="true"] { color: var(--bg); }
 .brow .top { align-items: flex-start; }
 .brow .nm { flex: 1; flex-wrap: wrap; row-gap: 4px; }
 .brow .top > span:last-child { flex-shrink: 0; }
+
+/* sub-budgets */
+.subrows { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 2px 16px; padding-left: 10px; border-left: 2px solid var(--line2); }
+.subrow { display: flex; flex-direction: column; gap: 4px; }
+.subrow .sr-top { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+.bar3 { display: block; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.bar3 > span { display: block; height: 100%; border-radius: 2px; }
+.subs-edit { display: flex; flex-direction: column; gap: 10px; }
+.subedit { display: grid; grid-template-columns: minmax(0, 1fr) 104px 36px; gap: 8px; align-items: center; }
+.subedit input { height: 44px; padding: 0 12px; border-radius: 12px; border: 1px solid var(--line2); background: var(--bg); color: var(--text); font-size: 16px; width: 100%; min-width: 0; }
+.subedit input:focus { outline: none; border-color: var(--text); }
+.subedit .subdel { width: 36px; height: 36px; border-radius: 18px; border: none; background: var(--line2); color: var(--muted); font-size: 20px; line-height: 1; }
+.subedit .subspent { grid-column: 1 / -1; margin-top: -4px; padding-left: 2px; }
+
+/* review */
+.rv { display: grid; grid-template-columns: minmax(0, 1fr) 74px 74px 80px; gap: 6px; font-size: 13px; align-items: center; }
+.rv > span:not(:first-child) { text-align: right; }
+.rv.head { font-size: 12px; color: var(--muted); font-weight: 600; }
+.rv .k { display: flex; align-items: center; gap: 8px; }
+.rv .d, .rvsub .d { font-size: 12px; }
+.rvsubs { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 2px 16px; padding-left: 10px; border-left: 2px solid var(--line2); }
+.rvsub { display: grid; grid-template-columns: minmax(0, 1fr) auto 80px; gap: 8px; font-size: 13px; align-items: center; }
+.rvsub > span:not(:first-child) { text-align: right; }
+.pace-mark { position: absolute; top: -3px; width: 2px; height: 14px; background: #fff; border-radius: 1px; transform: translateX(-1px); }
+@media (max-width: 360px) { .rv { grid-template-columns: minmax(0, 1fr) 72px 72px 80px; font-size: 13px; } }
